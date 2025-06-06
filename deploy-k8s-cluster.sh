@@ -33,7 +33,35 @@ deploy_cluster() {
     ansible-playbook -i "$INVENTORY_FILE" kubernetes-single-node.yaml
 
     echo "Deployment complete!"
-    echo "Check the instance details file for SSH access information." 
+    echo ""
+    echo "=== Instance Information ==="
+    
+    # Find the most recent instance details file
+    DETAILS_FILE=$(ls -rt instance-*-details.txt | tail -1)
+    
+    if [ -n "$DETAILS_FILE" ]; then
+        # Extract key information from the details file
+        INSTANCE_ID=$(grep "Instance ID:" "$DETAILS_FILE" | cut -d' ' -f3)
+        INSTANCE_NAME=$(grep "Instance Name:" "$DETAILS_FILE" | cut -d' ' -f3)
+        PUBLIC_IP=$(grep "Public IP:" "$DETAILS_FILE" | cut -d' ' -f3)
+        PRIVATE_IP=$(grep "Private IP:" "$DETAILS_FILE" | cut -d' ' -f3)
+        INSTANCE_TYPE=$(grep "Instance Type:" "$DETAILS_FILE" | cut -d' ' -f3)
+        SSH_COMMAND=$(grep "ssh -i" "$DETAILS_FILE")
+        
+        echo "Instance ID: $INSTANCE_ID"
+        echo "Instance Name: $INSTANCE_NAME"
+        echo "Instance Type: $INSTANCE_TYPE"
+        echo "Public IP: $PUBLIC_IP"
+        echo "Private IP: $PRIVATE_IP"
+        echo ""
+        echo "SSH Access:"
+        echo "$SSH_COMMAND"
+        echo ""
+        echo "Full details saved to: $DETAILS_FILE"
+    else
+        echo "Warning: Could not find instance details file"
+        echo "Check the instance details file for SSH access information."
+    fi 
 }
 
 cleanup_instances() {

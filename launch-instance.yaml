@@ -10,7 +10,7 @@
     key_pair: router-team-us-east2
     security_group_id: sg-0704e6bcaa5e655b1  # k8s security group
     root_volume_size: 500  # GB
-    instance_name: "GPU-Instance-{{ ansible_date_time.epoch }}"
+    instance_name: "{{ ansible_hostname }}-{{ ansible_date_time.epoch }}"
     
   tasks:
     - name: Ensure boto3 and botocore are installed
