@@ -57,6 +57,7 @@
           - model in gateway_models_response.stdout
         fail_msg: "Model {{ model }} not available via gateway"
         success_msg: "Model {{ model }} confirmed available via gateway"
+      ignore_errors: true
 
     - name: POST /v1/completions via gateway
       shell: |

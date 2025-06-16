@@ -247,41 +247,12 @@
       register: kubeadm_init
       when: not kubeconfig_exists.stat.exists
       
-    - name: Create .kube directory for user
-      file:
-        path: "{{ ansible_env.HOME }}/.kube"
-        state: directory
-        owner: "{{ ansible_user }}"
-        group: "{{ ansible_user }}"
-        mode: '0755'
-
-    - name: Create .kube directory for current user's home directory
-      file:
-        path: "{{ ansible_env.HOME | default(lookup('env', 'HOME')) }}/.kube"
-        state: directory
-        owner: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
-        group: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
-        mode: '0755'
-      when: ansible_env.USER != ansible_user or ansible_user is undefined
-
-    - name: Copy admin.conf to user's kube config
-      copy:
-        src: /etc/kubernetes/admin.conf
-        dest: "{{ ansible_env.HOME }}/.kube/config"
-        owner: "{{ ansible_user }}"
-        group: "{{ ansible_user }}"
-        mode: '0644'
-        remote_src: yes
-
-    - name: Copy admin.conf to current user's kube config
-      copy:
-        src: /etc/kubernetes/admin.conf
-        dest: "{{ ansible_env.HOME | default(lookup('env', 'HOME')) }}/.kube/config"
-        owner: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
-        group: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
-        mode: '0644'
-        remote_src: yes
-      when: ansible_env.USER != ansible_user or ansible_user is undefined
+    - name: Ensure ubuntu user has proper kube config
+      shell: |
+        mkdir -p /home/ubuntu/.kube
+        cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+        chown ubuntu:ubuntu /home/ubuntu/.kube/config
+        chmod 644 /home/ubuntu/.kube/config
 
     - name: Wait for Kubernetes nodes to be ready
       shell: kubectl get nodes --request-timeout=10s
