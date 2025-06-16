@@ -7,6 +7,30 @@
     model: "Qwen/Qwen3-0.6B"
     
   tasks:
+    - name: Copy stress test script to VM
+      copy:
+        src: files/interactive_stress_test.py
+        dest: /home/ubuntu/interactive_stress_test.py
+        mode: '0755'
+        owner: ubuntu
+        group: ubuntu
+      become: yes
+
+    - name: Install Python dependencies for stress test
+      apt:
+        name:
+          - python3-pip
+        state: present
+      become: yes
+
+    - name: Install Python packages for stress test
+      pip:
+        name:
+          - httpx
+          - numpy
+        state: present
+      become: yes
+
     - name: Create test id variable
       set_fact:
         test_id: "{{ 999999 | random }}"
