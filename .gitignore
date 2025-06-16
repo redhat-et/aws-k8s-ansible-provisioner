@@ -1,0 +1,9 @@
+# Ignore dynamically generated inventory files
+gpu-inventory-*.ini
+
+# Ignore instance detail files
+instance-*-details.txt
+
+# Ignore any other temporary files
+*.tmp
+*.temp 
