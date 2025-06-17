@@ -1,19 +1,81 @@
 # AWS Kubernetes Ansible Provisioner
 
-Make sure the ssh key is added to the AWS account. We use the key `router-team-us-east2.pem` for the instance.
+## Description
 
-## Deploy a New Cluster
+AWS Kubernetes Ansible Provisioner launches an AWS instance, and then installs
+Kubernetes and llm-d on the instance with one command.
+
+## Setup Instructions
+
+### 1. Get AWS credentials and `router-team-us-east2.pem` file from a team member.
+
+### 2. Create AWS Credentials File
+
+Create a file at `~/.aws/credentials` with the following content:
+
+```ini
+[default]
+aws_access_key_id = <aws_access_key_id>
+aws_secret_access_key = <aws_secret_access_key>
+```
+
+### 3. Set Up SSH Key
+
+Save `router-team-us-east2.pem` in your `~/.ssh/` directory and run:
+
+```bash
+chmod 400 ~/.ssh/router-team-us-east2.pem
+```
+
+### 4. Create Hugging Face Token File
+
+1. Get your token from: [https://huggingface.co/docs/hub/en/security-tokens](https://huggingface.co/docs/hub/en/security-tokens)
+2. Save it to:
+
+```bash
+mkdir -p ~/.cache/huggingface
+echo "<your_token>" > ~/.cache/huggingface/token
+```
+
+### 5. Install Ansible
+
+## Usage
+
+### 1. Run Deployment Script
+
+From the project directory, run:
 
 ```bash
 ./deploy-k8s-cluster.sh deploy
 ```
 
+### 2. Get Public IP Address
+
+Look for a log like the following:
+
+```
+Instance launched successfully!
+Instance ID: i-xxxxxxxxxxxxxxxxx
+Public IP: xxx.xxx.xxx.xxx
+```
+
+or get info from the `instance-*-details.txt` file that gets created.
+
+### 3. SSH Into the Instance
+
+Use the public IP:
+
+```bash
+ssh -i ~/.ssh/router-team-us-east2.pem ubuntu@xxx.xxx.xxx.xxx
+```
+
 ## Cleanup Resources
+
+When done, don't forget to delete your instance -- it costs $'s.
 
 ```bash
 ./deploy-k8s-cluster.sh cleanup
 ```
-
 
 ## Configuration
 
