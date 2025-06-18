@@ -139,10 +139,10 @@
 
     - name: Clone llm-d-deployer repository
       git:
-        repo: https://github.com/llm-d/llm-d-deployer.git
+        repo: https://github.com/yossiovadia/llm-d-deployer.git
         dest: /tmp/llm-d-deployer
         force: yes
-        version: main
+        version: fix/320-download-model-hf-uri
 
     - name: Copy base configuration to working directory
       copy:
