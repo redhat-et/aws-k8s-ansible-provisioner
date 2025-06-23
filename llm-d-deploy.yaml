@@ -192,6 +192,13 @@
       async: 1800  # 30 minutes timeout
       poll: 30
 
+    - name: Create PVC for model storage if not present (this is a workaround for the issue with the PVC not being created)
+      shell: |
+        kubectl get pvc model-pvc -n {{ llm_d_namespace }} > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+          kubectl create pvc model-pvc -n {{ llm_d_namespace }} --class=local-path --size=100Gi
+        fi
+
     - name: Display installation output
       debug:
         msg: "{{ llm_d_install.stdout_lines }}"
