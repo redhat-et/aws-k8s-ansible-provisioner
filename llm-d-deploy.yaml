@@ -194,10 +194,25 @@
 
     - name: Create PVC for model storage if not present (this is a workaround for the issue with the PVC not being created)
       shell: |
-        kubectl get pvc model-pvc -n {{ llm_d_namespace }} > /dev/null 2>&1
-        if [ $? -ne 0 ]; then
-          kubectl create pvc model-pvc -n {{ llm_d_namespace }} --class=local-path --size=100Gi
-        fi
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: model-pvc
+          namespace: {{ llm_d_namespace }}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: local-path
+          resources:
+            requests:
+              storage: 100Gi
+        EOF
+      become: no
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+      ignore_errors: yes
 
     - name: Display installation output
       debug:
