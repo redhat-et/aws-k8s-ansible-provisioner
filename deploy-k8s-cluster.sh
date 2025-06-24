@@ -9,15 +9,57 @@ usage() {
     echo "Commands:"
     echo "  deploy              Deploy a new K8s cluster on AWS GPU instance"
     echo "  cleanup             Cleanup AWS instances found in inventory files"
+    echo ""
+    echo "Deploy Options:"
+    echo "  --disable-auto-shutdown         Disable the auto-shutdown feature (default: enabled)"
+    echo "  --idle-timeout MINUTES          Set auto-shutdown idle timeout in minutes (default: 60)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 deploy                                    # Deploy with auto-shutdown enabled, 60min timeout"
+    echo "  $0 deploy --disable-auto-shutdown            # Deploy with auto-shutdown disabled"
+    echo "  $0 deploy --idle-timeout 30                  # Deploy with 30-minute timeout"
+    echo "  $0 deploy --disable-auto-shutdown --idle-timeout 120  # Multiple options"
     exit 1
 }
 
 # Function to deploy cluster
 deploy_cluster() {
+    local auto_shutdown_enabled="true"
+    local auto_shutdown_idle_time_minutes="60"
+    
+    # Parse arguments for deploy command
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --disable-auto-shutdown)
+                auto_shutdown_enabled="false"
+                shift
+                ;;
+            --idle-timeout)
+                if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                    auto_shutdown_idle_time_minutes="$2"
+                    shift 2
+                else
+                    echo "Error: --idle-timeout requires a numeric value"
+                    usage
+                fi
+                ;;
+            *)
+                echo "Unknown option: $1"
+                usage
+                ;;
+        esac
+    done
+
     echo "=== Deploying K8s Cluster on AWS GPU Instance ==="
+    echo "Auto-shutdown enabled: $auto_shutdown_enabled"
+    if [[ "$auto_shutdown_enabled" == "true" ]]; then
+        echo "Auto-shutdown idle timeout: $auto_shutdown_idle_time_minutes minutes"
+    fi
 
     echo "Launching AWS GPU instance..."
-    ansible-playbook launch-instance.yaml
+    ansible-playbook launch-instance.yaml \
+        -e "auto_shutdown_enabled=$auto_shutdown_enabled" \
+        -e "auto_shutdown_idle_time_minutes=$auto_shutdown_idle_time_minutes"
 
     echo "Finding generated inventory file..."
     INVENTORY_FILE=$(ls -rt gpu-inventory-*.ini | tail -1)
@@ -111,11 +153,7 @@ cleanup_instances() {
 case "${1:-}" in
     deploy)
         shift
-        if [ $# -ne 0 ]; then
-            echo "Deploy command doesn't accept additional arguments"
-            usage
-        fi
-        deploy_cluster
+        deploy_cluster "$@"
         ;;
     cleanup)
         shift
