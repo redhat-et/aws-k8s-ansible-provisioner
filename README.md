@@ -36,6 +36,10 @@ Make sure the ssh key is added to the AWS account. We use the key `router-team-u
 - **Storage**: Local Path Provisioner
 - **HuggingFace Token**: Add to ~/.cache/huggingface/token
 
+### Auto-Shutdown Settings (in launch-instance.yaml)
+- **auto_shutdown_enabled**: true
+- **auto_shutdown_idle_time_minutes**: 60
+
 ### SSH Connection
 ```bash
 ssh -i ~/.ssh/router-team-us-east2.pem ubuntu@<instance-ip>
