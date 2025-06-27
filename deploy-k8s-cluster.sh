@@ -40,6 +40,9 @@ deploy_cluster() {
     echo "Testing LLM-D..."
     ansible-playbook -i "$INVENTORY_FILE" llm-d-test.yaml
     
+    echo "Deploying OpenTelemetry Observability Stack..."
+    ansible-playbook -i "$INVENTORY_FILE" otel-observability-setup.yaml
+
     echo ""
     echo "=== Instance Information ==="
     
