@@ -8,6 +8,9 @@
   become: no  # Run as ubuntu user by default
   gather_facts: true
   vars:
+    # Override inventory become settings
+    ansible_become: no
+    ansible_become_method: null
     ansible_ssh_common_args: '-o ServerAliveInterval=30 -o ServerAliveCountMax=120 -o TCPKeepAlive=yes'
     ansible_ssh_timeout: 60
     ansible_user: ubuntu  # Explicitly set user
@@ -95,6 +98,10 @@
           apt install helm -y
         fi
       become: yes  # This needs root for package installation
+      vars:
+        ansible_become: yes
+        ansible_become_method: sudo
+        ansible_become_user: root
 
     # Setup storage class for each cluster
     - name: Install local-path-provisioner on each cluster
