@@ -12,6 +12,10 @@
     root_volume_size: 500  # GB
     instance_name: "{{ ansible_hostname }}-{{ ansible_date_time.epoch }}"
     
+    # Auto-shutdown feature configuration
+    auto_shutdown_enabled: true
+    auto_shutdown_idle_time_minutes: 60
+    
   tasks:
     - name: Ensure boto3 and botocore are installed
       pip:
@@ -31,6 +35,7 @@
         key_name: "{{ key_pair }}"
         security_groups:
           - "{{ security_group_id }}"
+        instance_initiated_shutdown_behavior: stop
         volumes:
           - device_name: /dev/sda1
             ebs:
@@ -78,6 +83,8 @@
         ansible_ssh_private_key_file: "~/.ssh/{{ key_pair }}.pem"
         ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
         instance_id: "{{ ec2_instance.instances[0].instance_id }}"
+        auto_shutdown_enabled: "{{ auto_shutdown_enabled }}"
+        auto_shutdown_idle_time_minutes: "{{ auto_shutdown_idle_time_minutes }}"
       when: ec2_instance.instances[0] is defined
 
     - name: Save instance details to file
@@ -159,4 +166,60 @@
 
     - name: Display GPU information
       debug:
-        msg: "GPU Information: {{ gpu_check.stdout if gpu_check.rc == 0 else 'No NVIDIA GPU detected' }}" 
+        msg: "GPU Information: {{ gpu_check.stdout if gpu_check.rc == 0 else 'No NVIDIA GPU detected' }}"
+
+
+- name: Configure Auto-Shutdown
+  hosts: gpu_instances
+  become: yes
+  gather_facts: no
+  
+  tasks:
+    - name: Copy auto-shutdown script to instance
+      copy:
+        src: files/auto-shutdown.sh
+        dest: /usr/local/bin/auto-shutdown.sh
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Create systemd service file for auto-shutdown
+      copy:
+        dest: /etc/systemd/system/auto-shutdown.service
+        content: |
+          [Unit]
+          Description=Auto Shutdown Service for Idle Instances
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          # Pass configuration to the script via environment variables
+          Environment="ENABLED={{ auto_shutdown_enabled | lower }}"
+          Environment="IDLE_TIME_MINUTES={{ auto_shutdown_idle_time_minutes }}"
+          ExecStart=/usr/local/bin/auto-shutdown.sh
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Create log file with proper permissions
+      file:
+        path: /var/log/auto-shutdown.log
+        state: touch
+        mode: '0664'
+        owner: root
+        group: adm
+
+    - name: Reload systemd to recognize new service
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start auto-shutdown service
+      systemd:
+        name: auto-shutdown
+        enabled: yes
+        state: started
+      when: auto_shutdown_enabled | bool 

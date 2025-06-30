@@ -283,6 +283,13 @@
         remote_src: yes
       when: ansible_env.USER != ansible_user or ansible_user is undefined
 
+    - name: Ensure ubuntu user has proper kube config
+      shell: |
+        mkdir -p /home/ubuntu/.kube
+        cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+        chown ubuntu:ubuntu /home/ubuntu/.kube/config
+        chmod 644 /home/ubuntu/.kube/config
+
     - name: Wait for Kubernetes nodes to be ready
       shell: kubectl get nodes --request-timeout=10s
       register: kubectl_nodes
