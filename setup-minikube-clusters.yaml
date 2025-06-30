@@ -1,0 +1,251 @@
+---
+- name: Setup Multi-Cluster Minikube on AWS Instance
+  hosts: all
+  become: no  # Run as ubuntu user by default  
+  gather_facts: true
+  vars:
+    ansible_user: ubuntu  # Explicitly set user
+    minikube_clusters:
+      - name: cluster-1
+        gpus: "0,1" # Comma-separated list of GPU indices to assign
+      - name: cluster-2
+        gpus: "2,3" # Assumes at least 4 GPUs are on the machine
+
+  tasks:
+    - name: Update system packages
+      apt:
+        update_cache: yes
+      become: yes  # This needs root for package management
+
+    - name: Configure system file descriptor limits for GPU operators
+      blockinfile:
+        path: /etc/security/limits.conf
+        block: |
+          * soft nofile 65536
+          * hard nofile 65536
+          root soft nofile 65536
+          root hard nofile 65536
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - File descriptor limits"
+      become: yes  # This needs root for system configuration
+
+    - name: Configure systemd default file descriptor limits
+      blockinfile:
+        path: /etc/systemd/system.conf
+        block: |
+          DefaultLimitNOFILE=65536
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Systemd file limits"
+        insertafter: '\[Manager\]'
+      become: yes  # This needs root for system configuration
+
+    - name: Increase kernel file descriptor limits
+      sysctl:
+        name: fs.file-max
+        value: '2097152'
+        state: present
+      become: yes  # This needs root for sysctl changes
+
+    - name: Apply sysctl changes
+      command: sysctl -p
+      become: yes  # This needs root for sysctl changes
+
+    - name: Set fs.protected_regular to 0 to fix minikube permission issues
+      sysctl:
+        name: fs.protected_regular
+        value: '0'
+        state: present
+      become: yes  # This needs root for sysctl changes
+
+    - name: Set fs.protected_fifos to 0 to fix additional permission issues
+      sysctl:
+        name: fs.protected_fifos
+        value: '0'
+        state: present
+      become: yes  # This needs root for sysctl changes
+
+    - name: Set fs.inotify.max_user_watches to 100000
+      sysctl:
+        name: fs.inotify.max_user_watches
+        value: '100000'
+        state: present
+      become: yes  # This needs root for sysctl changes
+        
+    - name: Set fs.inotify.max_user_instances to 100000
+      sysctl: 
+        name: fs.inotify.max_user_instances
+        value: '100000'
+        state: present
+      become: yes  # This needs root for sysctl changes
+
+    - name: Apply additional sysctl changes immediately
+      command: sysctl -p
+      become: yes  # This needs root for sysctl changes
+
+    - name: Reload systemd daemon to apply file descriptor limit changes
+      systemd:
+        daemon_reload: yes
+      become: yes  # This needs root for systemd changes
+
+    - name: Clean up existing bridge network if it exists
+      shell: |
+        # Clean up existing bridge network
+        docker network rm minikube-multi-cluster || true
+        
+        # Clean up any containers that might still be connected
+        for cluster in cluster-1 cluster-2; do
+          docker stop $cluster || true
+          docker rm $cluster || true
+        done
+      ignore_errors: yes
+
+    - name: Fix minikube permissions and sysctl settings
+      shell: |
+        # Fix the juju lock permission issue
+        sysctl fs.protected_regular=0
+        sysctl fs.protected_fifos=0
+        
+        # Ensure docker group membership is active
+        newgrp docker || true
+        
+        # Clean up any existing minikube temporary files
+        rm -rf /tmp/juju-mk* || true
+        rm -rf /tmp/minikube* || true
+        
+        # Set proper ownership for minikube directories
+        chown -R {{ ansible_user | default('ubuntu') }}:{{ ansible_user | default('ubuntu') }} /home/{{ ansible_user | default('ubuntu') }}/.minikube || true
+      become: yes  # This needs root for permissions and sysctl changes
+
+    - name: Ensure proper ownership of home directory for minikube user
+      file:
+        path: "/home/{{ ansible_user | default('ubuntu') }}"
+        owner: "{{ ansible_user | default('ubuntu') }}"
+        group: "{{ ansible_user | default('ubuntu') }}"
+        recurse: no
+      become: yes  # This needs root for changing ownership
+
+    - name: Install common dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+      become: yes  # This needs root for package installation
+
+    # Section to install Docker
+    - name: Add Docker's official GPG key
+      shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+      become: yes  # This needs root for system configuration
+
+    - name: Set up Docker repository
+      shell: |
+        echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+        tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+      become: yes  # This needs root for system configuration
+
+    - name: Install Docker Engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+      become: yes  # This needs root for package installation
+
+    - name: Add user to docker group
+      user:
+        name: "{{ ansible_user | default('ubuntu') }}"
+        groups: docker
+        append: yes
+      become: yes  # This needs root for user management
+
+    - name: Reset SSH connection to refresh group membership
+      meta: reset_connection
+
+    - name: Ensure Docker service is properly configured and running
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      become: yes  # This needs root for service management
+
+    # Section to install kubectl and minikube
+    - name: Download and install kubectl
+      shell: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      args:
+        creates: /usr/local/bin/kubectl
+      become: yes  # This needs root for installing to /usr/local/bin
+
+    - name: Download and install Minikube
+      shell: |
+        curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        install minikube /usr/local/bin/minikube
+      args:
+        creates: /usr/local/bin/minikube
+      become: yes  # This needs root for installing to /usr/local/bin
+
+    # Get GPU info and create clusters
+    - name: Get GPU UUIDs from nvidia-smi
+      shell: nvidia-smi --query-gpu=uuid --format=csv,noheader
+      register: gpu_uuids_result
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Set GPU UUIDs as a fact
+      set_fact:
+        gpu_uuids: "{{ gpu_uuids_result.stdout_lines }}"
+      when: gpu_uuids_result.rc == 0
+
+    - name: Display found GPU UUIDs
+      debug:
+        var: gpu_uuids
+      when: gpu_uuids is defined
+
+    - name: Copy minikube cluster creation script to remote host
+      copy:
+        src: create-minikube-cluster.sh
+        dest: /tmp/create-minikube-cluster.sh
+        mode: '0755'
+      become: yes  # This needs root for copying to /tmp
+
+    - name: Delete existing minikube clusters if they exist
+      loop: "{{ minikube_clusters }}"
+      loop_control:
+        loop_var: cluster
+      shell: |
+        minikube delete --profile="{{ cluster.name }}" || true
+        rm -rf ~/.minikube/profiles/{{ cluster.name }} || true
+      ignore_errors: yes
+
+    - name: Clean up any remaining temporary files after deletion
+      shell: |
+        rm -rf /tmp/juju-mk*
+        rm -rf /tmp/minikube*
+      ignore_errors: yes
+      become: yes  # This needs root for cleaning up /tmp files
+
+    - name: Create and configure Minikube clusters
+      shell: |
+        sudo -u {{ ansible_user | default('ubuntu') }} -i bash << 'EOF'
+        cd /tmp
+        /tmp/create-minikube-cluster.sh {{ cluster.name }} {{ cluster.gpus }}
+        EOF
+      loop: "{{ minikube_clusters }}"
+      loop_control:
+        loop_var: cluster
+      become: yes  # This needs root to sudo to ubuntu user 

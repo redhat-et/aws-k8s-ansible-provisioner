@@ -1,0 +1,1091 @@
+---
+# Multi-Cluster Observability Setup for Minikube with Docker Bridge Network
+# Installs OTEL, DCGM, and vLLM on each cluster with centralized metrics collection
+# Run with: ansible-playbook -i inventory.ini multi-cluster-observability-setup.yaml
+
+- name: Setup Multi-Cluster Observability on Minikube
+  hosts: all
+  become: no  # Run as ubuntu user by default
+  gather_facts: true
+  vars:
+    ansible_ssh_common_args: '-o ServerAliveInterval=30 -o ServerAliveCountMax=120 -o TCPKeepAlive=yes'
+    ansible_ssh_timeout: 60
+    ansible_user: ubuntu  # Explicitly set user
+    minikube_clusters:
+      - name: cluster-1
+        role: central  # This cluster hosts the central Prometheus
+        gpus: "0,1"
+      - name: cluster-2
+        role: remote   # This cluster sends metrics to central
+        gpus: "2,3"
+    
+    # Central observability configuration
+    central_prometheus_namespace: "central-monitoring"
+    otel_namespace: "observability"
+    vllm_namespace: "vllm"
+    central_cluster_name: "cluster-1"
+    bridge_network_name: "minikube-multi-cluster"
+    
+    # Networking configuration for cross-cluster communication
+    central_prometheus_port: 9090
+    central_prometheus_service_name: "central-prometheus"
+    
+    # vLLM configuration
+    vllm_image: "vllm/vllm-openai:latest"
+    vllm_model_name: "microsoft/Phi-3-mini-4k-instruct"
+    vllm_deployment_name: "vllm-phi3-mini"
+    vllm_pvc_name: "model-storage"
+
+  tasks:
+    # Update minikube contexts for kubectl access
+    - name: Update minikube contexts for kubectl access
+      shell: |
+        minikube update-context --profile="{{ item.name }}"
+      loop: "{{ minikube_clusters }}"
+
+    # Get cluster IPs from Docker bridge network
+    - name: Create script to get cluster IP from bridge network
+      copy:
+        content: |
+          #!/bin/bash
+          set -ex
+          CLUSTER_NAME="$1"
+          BRIDGE_NETWORK_NAME="$2"
+          
+          # Get the bridge network ID
+          BRIDGE_ID=$(docker network inspect "$BRIDGE_NETWORK_NAME" --format='{% raw %}{{.Id}}{% endraw %}')
+          
+          # Get the container IP for this cluster on the bridge network
+          CLUSTER_IP=$(docker inspect "$CLUSTER_NAME" --format='{% raw %}{{range .NetworkSettings.Networks}}{{if eq .NetworkID {% endraw %}"'$BRIDGE_ID'"{% raw %}}}{{.IPAddress}}{{end}}{{end}}{% endraw %}')
+          
+          if [ -z "$CLUSTER_IP" ]; then
+            echo "ERROR: Could not find IP for cluster $CLUSTER_NAME on bridge network $BRIDGE_NETWORK_NAME" >&2
+            exit 1
+          fi
+          
+          echo "$CLUSTER_IP"
+        dest: /tmp/get-cluster-ip.sh
+        mode: '0755'
+
+    - name: Get cluster IPs from Docker bridge network
+      shell: /tmp/get-cluster-ip.sh {{ item.name }} {{ bridge_network_name }}
+      loop: "{{ minikube_clusters }}"
+      register: cluster_ips_result
+
+    - name: Set cluster IPs as facts
+      set_fact:
+        cluster_ips: "{{ cluster_ips | default({}) | combine({item.item.name: item.stdout.strip()}) }}"
+      loop: "{{ cluster_ips_result.results }}"
+
+    - name: Display cluster IPs on bridge network
+      debug:
+        msg: |
+          Cluster IPs on bridge network {{ bridge_network_name }}:
+          {% for cluster in minikube_clusters %}
+          - {{ cluster.name }}: {{ cluster_ips[cluster.name] }}
+          {% endfor %}
+
+    # Install Helm on the host system (required for all clusters)
+    - name: Install Helm
+      shell: |
+        if ! command -v helm &> /dev/null; then
+          curl https://baltocdn.com/helm/signing.asc | gpg --dearmor > /usr/share/keyrings/helm.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" > /etc/apt/sources.list.d/helm-stable-debian.list
+          apt update
+          apt install helm -y
+        fi
+      become: yes  # This needs root for package installation
+
+    # Setup storage class for each cluster
+    - name: Install local-path-provisioner on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/refs/heads/master/deploy/local-path-storage.yaml
+      loop: "{{ minikube_clusters }}"
+
+    - name: Wait for local-path-provisioner to be ready on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl wait --for=condition=ready pod -l app=local-path-provisioner -n local-path-storage --timeout=300s
+      loop: "{{ minikube_clusters }}"
+
+    - name: Set local-path as default storage class on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      loop: "{{ minikube_clusters }}"
+
+    # Create vLLM namespace and PVC for each cluster
+    - name: Create vLLM namespace on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl create namespace {{ vllm_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      loop: "{{ minikube_clusters }}"
+
+    - name: Create PVC for model storage on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: {{ vllm_pvc_name }}
+          namespace: {{ vllm_namespace }}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: local-path
+          resources:
+            requests:
+              storage: 100Gi
+        EOF
+      loop: "{{ minikube_clusters }}"
+
+    # Setup GPU Operator for each cluster  
+    - name: Add NVIDIA Helm repo for each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia || true
+        helm repo update
+      loop: "{{ minikube_clusters }}"
+
+    - name: Install NVIDIA GPU Operator on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        helm upgrade --install gpu-operator nvidia/gpu-operator \
+          --namespace gpu-operator \
+          --create-namespace \
+          --set driver.enabled=true \
+          --set operator.defaultRuntime=docker \
+          --set toolkit.enabled=true \
+          --wait \
+          --timeout=15m
+      loop: "{{ minikube_clusters }}"
+      register: gpu_operator_install
+      retries: 2
+      delay: 60
+
+    - name: Wait for GPU Operator to be ready on each cluster
+      shell: |
+        echo "Waiting for GPU Operator pods to be ready on {{ item.name }}..."
+        kubectl config use-context {{ item.name }}
+        
+        # Wait for device plugin with shorter timeout and retry logic
+        echo "Checking nvidia-device-plugin-daemonset..."
+        for i in {1..6}; do
+          if kubectl wait --for=condition=ready pod -l app=nvidia-device-plugin-daemonset -n gpu-operator --timeout=120s; then
+            echo "nvidia-device-plugin-daemonset is ready"
+            break
+          else
+            echo "Attempt $i/6: nvidia-device-plugin-daemonset not ready yet, retrying..."
+            sleep 30
+          fi
+        done
+        
+        # Wait for DCGM exporter with shorter timeout and retry logic  
+        echo "Checking nvidia-dcgm-exporter..."
+        for i in {1..6}; do
+          if kubectl wait --for=condition=ready pod -l app=nvidia-dcgm-exporter -n gpu-operator --timeout=120s; then
+            echo "nvidia-dcgm-exporter is ready"
+            break
+          else
+            echo "Attempt $i/6: nvidia-dcgm-exporter not ready yet, retrying..."
+            sleep 30
+          fi
+        done
+        
+        echo "GPU Operator readiness check completed for {{ item.name }}"
+      loop: "{{ minikube_clusters }}"
+      retries: 2
+      delay: 60
+
+    # Setup vLLM on each cluster
+    # GPU allocation: cluster-1 uses GPU 0, cluster-2 uses GPU 2 (single GPU per cluster since tensor-parallel-size=1)
+    - name: Deploy vLLM on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl apply -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: {{ vllm_deployment_name }}
+          namespace: {{ vllm_namespace }}
+          labels:
+            app: vllm
+            cluster: {{ item.name }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: vllm
+          template:
+            metadata:
+              labels:
+                app: vllm
+                cluster: {{ item.name }}
+              annotations:
+                prometheus.io/scrape: "true"
+                prometheus.io/port: "8000"
+                prometheus.io/path: "/metrics"
+            spec:
+              containers:
+              - name: vllm
+                image: {{ vllm_image }}
+                args:
+                  - "--model"
+                  - "{{ vllm_model_name }}"
+                  - "--host"
+                  - "0.0.0.0"
+                  - "--port"
+                  - "8000"
+                  - "--gpu-memory-utilization"
+                  - "0.8"
+                  - "--max-model-len"
+                  - "4096"
+                  - "--tensor-parallel-size"
+                  - "1"
+                  - "--enable-auto-tool-choice"
+                  - "--tool-call-parser"
+                  - "hermes"
+                ports:
+                - containerPort: 8000
+                  name: http
+                resources:
+                  requests:
+                    nvidia.com/gpu: 1
+                    memory: "4Gi"
+                    cpu: "2"
+                  limits:
+                    nvidia.com/gpu: 1
+                    memory: "8Gi"
+                    cpu: "4"
+                volumeMounts:
+                - name: model-storage
+                  mountPath: /root/.cache/huggingface
+                env:
+                - name: CUDA_VISIBLE_DEVICES
+                  value: "{% if item.name == 'cluster-1' %}0{% elif item.name == 'cluster-2' %}2{% else %}0{% endif %}"
+                - name: HF_HOME
+                  value: "/root/.cache/huggingface"
+              volumes:
+              - name: model-storage
+                persistentVolumeClaim:
+                  claimName: {{ vllm_pvc_name }}
+              tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: {{ vllm_deployment_name }}-service
+          namespace: {{ vllm_namespace }}
+          labels:
+            app: vllm
+            cluster: {{ item.name }}
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8000"
+            prometheus.io/path: "/metrics"
+        spec:
+          selector:
+            app: vllm
+          ports:
+          - name: http
+            port: 8000
+            targetPort: 8000
+          type: ClusterIP
+        EOF
+      loop: "{{ minikube_clusters }}"
+
+    - name: Wait for vLLM to be ready on each cluster
+      shell: |
+        echo "Waiting for vLLM deployment to be ready on {{ item.name }}..."
+        kubectl config use-context {{ item.name }}
+        kubectl wait --for=condition=available deployment/{{ vllm_deployment_name }} -n {{ vllm_namespace }} --timeout=600s
+      loop: "{{ minikube_clusters }}"
+
+    # Setup Central Prometheus (only on cluster-1)
+    - name: Create central monitoring namespace on cluster-1
+      shell: |
+        kubectl config use-context cluster-1
+        kubectl create namespace {{ central_prometheus_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Deploy Central Prometheus with ClusterIP service on cluster-1
+      shell: |
+        kubectl config use-context cluster-1
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: central-prometheus-config
+          namespace: {{ central_prometheus_namespace }}
+        data:
+          prometheus.yml: |
+            global:
+              scrape_interval: 15s
+              evaluation_interval: 15s
+              external_labels:
+                environment: "multi-cluster"
+                region: "local"
+            
+            scrape_configs:
+              - job_name: 'prometheus'
+                static_configs:
+                  - targets: ['localhost:9090']
+            
+            remote_write:
+              - url: http://localhost:9090/api/v1/write
+                queue_config:
+                  max_samples_per_send: 1000
+                  max_shards: 200
+                  capacity: 2500
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: {{ central_prometheus_service_name }}
+          namespace: {{ central_prometheus_namespace }}
+          labels:
+            app: central-prometheus
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: central-prometheus
+          template:
+            metadata:
+              labels:
+                app: central-prometheus
+            spec:
+              containers:
+              - name: prometheus
+                image: prom/prometheus:v2.47.0
+                args:
+                  - '--config.file=/etc/prometheus/prometheus.yml'
+                  - '--storage.tsdb.path=/prometheus/'
+                  - '--web.console.libraries=/etc/prometheus/console_libraries'
+                  - '--web.console.templates=/etc/prometheus/consoles'
+                  - '--storage.tsdb.retention.time=30d'
+                  - '--storage.tsdb.retention.size=20GB'
+                  - '--web.enable-lifecycle'
+                  - '--web.enable-remote-write-receiver'
+                  - '--enable-feature=remote-write-receiver'
+                  - '--web.listen-address=0.0.0.0:9090'
+                ports:
+                - containerPort: 9090
+                  name: web
+                volumeMounts:
+                - name: prometheus-config
+                  mountPath: /etc/prometheus
+                - name: prometheus-storage
+                  mountPath: /prometheus
+                resources:
+                  requests:
+                    memory: "2Gi"
+                    cpu: "1000m"
+                  limits:
+                    memory: "4Gi"
+                    cpu: "2000m"
+              volumes:
+              - name: prometheus-config
+                configMap:
+                  name: central-prometheus-config
+              - name: prometheus-storage
+                emptyDir:
+                  sizeLimit: 20Gi
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: {{ central_prometheus_service_name }}
+          namespace: {{ central_prometheus_namespace }}
+          labels:
+            app: central-prometheus
+        spec:
+          selector:
+            app: central-prometheus
+          ports:
+          - name: web
+            port: 9090
+            targetPort: 9090
+          type: ClusterIP
+        EOF
+
+    - name: Wait for Central Prometheus to be ready
+      shell: |
+        echo "Waiting for Central Prometheus to be ready on cluster-1..."
+        kubectl config use-context cluster-1
+        kubectl wait --for=condition=ready pod -l app=central-prometheus -n {{ central_prometheus_namespace }} --timeout=300s
+
+    # Setup OpenTelemetry for each cluster
+    - name: Create observability namespace on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl create namespace {{ otel_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      loop: "{{ minikube_clusters }}"
+
+    - name: Install cert-manager on each cluster (required for OTEL Operator)
+      shell: |
+          echo "Installing cert-manager on {{ item.name }}..."
+          kubectl config use-context {{ item.name }}
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.3/cert-manager.yaml
+          kubectl wait --for condition=established --timeout=60s crd/certificates.cert-manager.io
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
+      loop: "{{ minikube_clusters }}"
+      
+
+    - name: Add OpenTelemetry Helm repository for each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
+        helm repo update
+      loop: "{{ minikube_clusters }}"
+
+    - name: Install OpenTelemetry Operator on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        
+        # Check if already installed
+        if helm list -n opentelemetry-operator-system | grep -q opentelemetry-operator; then
+          echo "OpenTelemetry Operator already installed on {{ item.name }}"
+        else
+          echo "Installing OpenTelemetry Operator on {{ item.name }}..."
+          helm upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
+            --namespace opentelemetry-operator-system \
+            --create-namespace \
+            --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib \
+            --wait --timeout=10m
+        fi
+      loop: "{{ minikube_clusters }}"
+      register: otel_operator_install
+      retries: 3
+      delay: 30
+
+    - name: Wait for OpenTelemetry Operator to be ready on each cluster
+      shell: |
+        echo "Waiting for OpenTelemetry Operator to be ready on {{ item.name }}..."
+        
+        # Wait for namespace to exist
+        timeout=60
+        kubectl config use-context {{ item.name }}
+        while ! kubectl get namespace opentelemetry-operator-system >/dev/null 2>&1; do
+          echo "Waiting for opentelemetry-operator-system namespace..."
+          sleep 5
+          timeout=$((timeout - 5))
+          if [ $timeout -le 0 ]; then
+            echo "Timeout waiting for namespace"
+            exit 1
+          fi
+        done
+        
+        # Wait for CRDs to be established
+        echo "Waiting for OpenTelemetry CRDs..."
+        kubectl config use-context {{ item.name }}
+        kubectl wait --for condition=established --timeout=120s crd/opentelemetrycollectors.opentelemetry.io || {
+          echo "CRD not found, checking if operator is installed..."
+          kubectl get pods -n opentelemetry-operator-system
+          exit 1
+        }
+        
+        # Wait for operator pod to be ready
+        echo "Waiting for OpenTelemetry Operator pod..."
+        kubectl config use-context {{ item.name }}
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=opentelemetry-operator -n opentelemetry-operator-system --timeout=300s
+        
+        echo "OpenTelemetry Operator is ready on {{ item.name }}"
+      loop: "{{ minikube_clusters }}"
+      retries: 2
+      delay: 60
+
+    - name: Create RBAC for OpenTelemetry Collector on each cluster
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: otel-collector-deployment
+          namespace: {{ otel_namespace }}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: otel-collector-{{ item.name }}
+        rules:
+        - apiGroups: [""]
+          resources: ["pods", "namespaces", "nodes", "services", "endpoints"]
+          verbs: ["get", "watch", "list"]
+        - apiGroups: ["apps"]
+          resources: ["replicasets"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["extensions"]
+          resources: ["replicasets"]
+          verbs: ["get", "list", "watch"]
+        - nonResourceURLs: ["/metrics"]
+          verbs: ["get"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: otel-collector-{{ item.name }}
+        subjects:
+        - kind: ServiceAccount
+          name: otel-collector-deployment
+          namespace: {{ otel_namespace }}
+        roleRef:
+          kind: ClusterRole
+          name: otel-collector-{{ item.name }}
+          apiGroup: rbac.authorization.k8s.io
+        EOF
+      loop: "{{ minikube_clusters }}"
+
+    - name: Deploy OpenTelemetry Collector with updated endpoint configuration
+      shell: |
+        kubectl config use-context {{ item.name }}
+        kubectl apply -f - <<EOF
+        apiVersion: opentelemetry.io/v1beta1
+        kind: OpenTelemetryCollector
+        metadata:
+          name: otel-metrics-collector
+          namespace: {{ otel_namespace }}
+        spec:
+          mode: daemonset
+          serviceAccount: otel-collector-deployment
+          env:
+            - name: CLUSTER_NAME
+              value: "{{ item.name }}"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          config:
+            receivers:
+              prometheus:
+                config:
+                  scrape_configs:
+                    # vLLM metrics from vllm namespace
+                    - job_name: 'vllm-metrics'
+                      kubernetes_sd_configs:
+                        - role: pod
+                          namespaces:
+                            names:
+                              - {{ vllm_namespace }}
+                      relabel_configs:
+                        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                          action: keep
+                          regex: true
+                        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                          action: replace
+                          target_label: __metrics_path__
+                          regex: (.+)
+                        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                          action: replace
+                          target_label: __metrics_path__
+                          regex: ^$
+                          replacement: /metrics
+                        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                          action: replace
+                          regex: ([^:]+)(?::\d+)?;(\d+)
+                          replacement: \$1:\$2
+                          target_label: __address__
+                        - source_labels: [__address__]
+                          action: replace
+                          regex: ([^:]+)(?::\d+)?
+                          replacement: \$1:8000
+                          target_label: __address__
+                        - action: labelmap
+                          regex: __meta_kubernetes_pod_label_(.+)
+                        - source_labels: [__meta_kubernetes_namespace]
+                          action: replace
+                          target_label: kubernetes_namespace
+                        - source_labels: [__meta_kubernetes_pod_name]
+                          action: replace
+                          target_label: kubernetes_pod_name
+                        - source_labels: [__meta_kubernetes_pod_node_name]
+                          action: replace
+                          target_label: kubernetes_node_name
+                        - target_label: cluster_name
+                          replacement: {{ item.name }}
+                        - target_label: cluster
+                          replacement: {{ item.name }}
+                        - target_label: service
+                          replacement: vllm
+                    
+                    # DCGM GPU metrics from gpu-operator namespace
+                    - job_name: 'dcgm-exporter'
+                      kubernetes_sd_configs:
+                        - role: service
+                          namespaces:
+                            names:
+                              - gpu-operator
+                      relabel_configs:
+                        - source_labels: [__meta_kubernetes_service_label_app]
+                          action: keep
+                          regex: nvidia-dcgm-exporter
+                        - source_labels: [__meta_kubernetes_service_port_name]
+                          action: keep
+                          regex: gpu-metrics
+                        - action: labelmap
+                          regex: __meta_kubernetes_service_label_(.+)
+                        - source_labels: [__meta_kubernetes_namespace]
+                          action: replace
+                          target_label: kubernetes_namespace
+                        - source_labels: [__meta_kubernetes_service_name]
+                          action: replace
+                          target_label: kubernetes_service_name
+                        - target_label: cluster_name
+                          replacement: {{ item.name }}
+                        - target_label: cluster
+                          replacement: {{ item.name }}
+                    
+                    # Kubernetes node metrics
+                    - job_name: 'kubernetes-nodes'
+                      kubernetes_sd_configs:
+                        - role: node
+                      relabel_configs:
+                        - action: labelmap
+                          regex: __meta_kubernetes_node_label_(.+)
+                        - target_label: __address__
+                          replacement: kubernetes.default.svc:443
+                        - source_labels: [__meta_kubernetes_node_name]
+                          regex: (.+)
+                          target_label: __metrics_path__
+                          replacement: /api/v1/nodes/\$1/proxy/metrics
+                        - target_label: cluster_name
+                          replacement: {{ item.name }}
+                        - target_label: cluster
+                          replacement: {{ item.name }}
+                    
+                    # Kubernetes cAdvisor metrics
+                    - job_name: 'kubernetes-cadvisor'
+                      kubernetes_sd_configs:
+                        - role: node
+                      relabel_configs:
+                        - action: labelmap
+                          regex: __meta_kubernetes_node_label_(.+)
+                        - target_label: __address__
+                          replacement: kubernetes.default.svc:443
+                        - source_labels: [__meta_kubernetes_node_name]
+                          regex: (.+)
+                          target_label: __metrics_path__
+                          replacement: /api/v1/nodes/\$1/proxy/metrics/cadvisor
+                        - target_label: cluster_name
+                          replacement: {{ item.name }}
+                        - target_label: cluster
+                          replacement: {{ item.name }}
+              
+              otlp:
+                protocols:
+                  grpc:
+                    endpoint: 0.0.0.0:4317
+                  http:
+                    endpoint: 0.0.0.0:4318
+            
+            processors:
+              batch:
+                timeout: 1s
+                send_batch_size: 1024
+              
+              memory_limiter:
+                check_interval: 1s
+                limit_percentage: 50
+                spike_limit_percentage: 30
+              
+              resource:
+                attributes:
+                  - key: cluster.name
+                    value: {{ item.name }}
+                    action: upsert
+                  - key: cluster.environment
+                    value: "multi-cluster"
+                    action: upsert
+                  - key: k8s.cluster.name
+                    value: {{ item.name }}
+                    action: upsert
+              
+              metricstransform:
+                transforms:
+                  - include: ".*"
+                    match_type: regexp
+                    action: update
+                    operations:
+                      - action: add_label
+                        new_label: cluster_name
+                        new_value: {{ item.name }}
+                      - action: add_label
+                        new_label: cluster
+                        new_value: {{ item.name }}
+              
+              k8sattributes:
+                auth_type: "serviceAccount"
+                passthrough: false
+                extract:
+                  metadata:
+                    - k8s.pod.name
+                    - k8s.pod.uid
+                    - k8s.deployment.name
+                    - k8s.namespace.name
+                    - k8s.node.name
+                    - k8s.pod.start_time
+                  labels:
+                    - tag_name: k8s.pod.label.app
+                      key: app
+                      from: pod
+                    - tag_name: k8s.pod.label.version
+                      key: version
+                      from: pod
+                pod_association:
+                  - sources:
+                    - from: resource_attribute
+                      name: k8s.pod.ip
+                  - sources:
+                    - from: resource_attribute
+                      name: k8s.pod.uid
+                  - sources:
+                    - from: connection
+              
+              resourcedetection:
+                detectors: [env, system, k8snode]
+                timeout: 5s
+                override: false
+                system:
+                  hostname_sources: [os]
+                k8snode:
+                  auth_type: serviceAccount
+                  node_from_env_var: K8S_NODE_NAME
+            
+            exporters:
+              prometheusremotewrite:
+                # Use direct bridge network IP for cluster-1 central Prometheus
+                endpoint: "http://{{ cluster_ips['cluster-1'] }}:9090/api/v1/write"
+                tls:
+                  insecure: true
+                external_labels:
+                  cluster: {{ item.name }}
+                  cluster_name: {{ item.name }}
+                  environment: "multi-cluster"
+                  region: "local"
+                  collector_type: "otel"
+                headers:
+                  X-Prometheus-Remote-Write-Version: "0.1.0"
+              
+              debug:
+                verbosity: normal
+                sampling_initial: 5
+                sampling_thereafter: 200
+            
+            service:
+              pipelines:
+                metrics:
+                  receivers: [prometheus, otlp]
+                  processors: [memory_limiter, resource, metricstransform, k8sattributes, resourcedetection, batch]
+                  exporters: [prometheusremotewrite, debug]
+                
+                traces:
+                  receivers: [otlp]
+                  processors: [memory_limiter, resource, k8sattributes, resourcedetection, batch]
+                  exporters: [debug]
+        EOF
+      loop: "{{ minikube_clusters }}"
+
+    - name: Wait for OpenTelemetry Collector to be ready on each cluster
+      shell: |
+        echo "Waiting for OpenTelemetry Collector to be ready on {{ item.name }}..."
+        kubectl config use-context {{ item.name }}
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=otel-metrics-collector -n {{ otel_namespace }} --timeout=300s || true
+      loop: "{{ minikube_clusters }}"
+
+# Final verification and status check
+- name: Verify Multi-Cluster Setup
+  hosts: all
+  become: no  # Run as ubuntu user by default
+  gather_facts: false
+  vars:
+    ansible_user: ubuntu  # Explicitly set user
+    bridge_network_name: "minikube-multi-cluster"  # Add missing variable
+    minikube_clusters:
+      - name: cluster-1
+        role: central
+      - name: cluster-2
+        role: remote
+    central_prometheus_port: 9090
+    central_prometheus_namespace: "central-monitoring"
+    otel_namespace: "observability"
+    vllm_namespace: "vllm"
+
+  tasks:
+    # Re-discover cluster IPs since variables don't carry over between playbooks
+    - name: Get cluster IPs from Docker bridge network for verification
+      shell: /tmp/get-cluster-ip.sh {{ item.name }} {{ bridge_network_name }}
+      loop: "{{ minikube_clusters }}"
+      register: cluster_ips_result
+
+    - name: Set cluster IPs as facts for verification
+      set_fact:
+        cluster_ips: "{{ cluster_ips | default({}) | combine({item.item.name: item.stdout.strip()}) }}"
+      loop: "{{ cluster_ips_result.results }}"
+
+    - name: Display cluster status for each cluster
+      shell: |
+        echo "=== Cluster Status for {{ item.name }} ==="
+        echo "Role: {{ item.role }}"
+        
+        echo "Cluster Status:"
+        minikube status -p "{{ item.name }}" || echo "Cluster not running"
+        
+        echo ""
+        echo "GPU Operator Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n gpu-operator -l app=nvidia-dcgm-exporter || echo "DCGM exporter not found"
+        
+        echo ""
+        echo "vLLM Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n {{ vllm_namespace }} -l app=vllm || echo "vLLM not found"
+        
+        echo ""
+        echo "OTEL Collector Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n {{ otel_namespace }} -l app.kubernetes.io/name=otel-metrics-collector || echo "OTEL collector not found"
+        
+        {% if item.role == "central" %}
+        echo ""
+        echo "Central Prometheus Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n {{ central_prometheus_namespace }} -l app=central-prometheus || echo "Central Prometheus not found"
+        {% endif %}
+        
+        echo ""
+        echo "=========================="
+        echo ""
+      loop: "{{ minikube_clusters }}"
+      register: cluster_status
+
+    - name: Get host IP and display connection information
+      shell: hostname -I | awk '{print $1}'
+      register: host_ip_result
+
+    - name: Test cluster IPs from Docker bridge network
+      shell: /tmp/get-cluster-ip.sh {{ item.name }} {{ bridge_network_name }}
+      loop: "{{ minikube_clusters }}"
+      register: cluster_ips_result
+
+    - name: Set cluster IPs as facts
+      set_fact:
+        cluster_ips: "{{ cluster_ips | default({}) | combine({item.item.name: item.stdout.strip()}) }}"
+      loop: "{{ cluster_ips_result.results }}"
+
+    - name: Display Multi-Cluster Observability Setup Summary
+      debug:
+        msg: |
+          ========================================
+          Multi-Cluster Observability Setup Complete!
+          ========================================
+          
+          CLUSTERS DEPLOYED:
+          {% for cluster in minikube_clusters %}
+          - {{ cluster.name }} ({{ cluster.role }}) - IP: {{ cluster_ips[cluster.name] }}
+          {% endfor %}
+          
+          DOCKER BRIDGE NETWORK:
+          - Network Name: {{ bridge_network_name }}
+          - Subnet: 172.30.0.0/16
+          - All clusters connected to shared bridge network
+          
+          CENTRAL PROMETHEUS ACCESS:
+          - Bridge Network IP: {{ cluster_ips['cluster-1'] }}:9090
+          - Internal Service: http://central-prometheus.{{ central_prometheus_namespace }}.svc.cluster.local:9090
+          - All clusters send metrics directly via bridge network: http://{{ cluster_ips['cluster-1'] }}:9090/api/v1/write
+          
+          NETWORKING SOLUTION:
+          - Custom Docker bridge network ({{ bridge_network_name }})
+          - Direct container-to-container communication
+          - No port forwarding required
+          - cluster-1: {{ cluster_ips['cluster-1'] }} → central Prometheus
+          - cluster-2: {{ cluster_ips['cluster-2'] }} → sends metrics to cluster-1
+          
+          To access Central Prometheus UI:
+          kubectl config use-context cluster-1
+          kubectl port-forward -n {{ central_prometheus_namespace }} svc/central-prometheus 9090:9090
+          
+          Or access directly from any cluster container: http://{{ cluster_ips['cluster-1'] }}:9090
+          
+          METRICS COLLECTION:
+          - All clusters send metrics to Central Prometheus on cluster-1 via bridge network
+          - Each cluster identified by cluster_name and cluster labels
+          - vLLM metrics: cluster-scoped from each deployment in vllm namespace
+          - DCGM metrics: GPU metrics from each cluster's GPU Operator
+          - Kubernetes metrics: Node and cAdvisor metrics from each cluster
+          
+          USEFUL QUERIES:
+          - All metrics from cluster-1: {cluster_name="cluster-1"}
+          - All metrics from cluster-2: {cluster_name="cluster-2"}
+          - vLLM request rate: rate(vllm_request_total[5m])
+          - GPU utilization by cluster: DCGM_FI_DEV_GPU_UTIL group by (cluster_name)
+          
+          BRIDGE NETWORK TROUBLESHOOTING:
+          - Check network: docker network inspect {{ bridge_network_name }}
+          - Check cluster IPs: docker inspect cluster-1 cluster-2 --format='{{ "{{.Name}}: {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" }}'
+          - Test connectivity: docker exec cluster-2 ping {{ cluster_ips['cluster-1'] }}
+          - Direct Prometheus access: docker exec cluster-2 curl http://{{ cluster_ips['cluster-1'] }}:9090/api/v1/status/config
+          
+          TO MANAGE CLUSTERS:
+          - minikube status -p cluster-1
+          - kubectl config use-context cluster-1
+          - kubectl get pods -A
+          - kubectl config use-context cluster-2
+          - kubectl get pods -A
+          
+          ========================================
+
+    - name: Test bridge network connectivity between clusters
+      shell: |
+        echo "Testing bridge network connectivity..."
+        
+        # Test ping connectivity from cluster-2 to cluster-1
+        echo "Testing ping from cluster-2 to cluster-1 ({{ cluster_ips['cluster-1'] }})..."
+        if docker exec cluster-2 ping -c 3 {{ cluster_ips['cluster-1'] }} > /dev/null 2>&1; then
+          echo "✓ Ping successful: cluster-2 → cluster-1"
+        else
+          echo "✗ Ping failed: cluster-2 → cluster-1"
+        fi
+        
+        # Test ping connectivity from cluster-1 to cluster-2
+        echo "Testing ping from cluster-1 to cluster-2 ({{ cluster_ips['cluster-2'] }})..."
+        if docker exec cluster-1 ping -c 3 {{ cluster_ips['cluster-2'] }} > /dev/null 2>&1; then
+          echo "✓ Ping successful: cluster-1 → cluster-2"
+        else
+          echo "✗ Ping failed: cluster-1 → cluster-2"
+        fi
+        
+        echo "Bridge network connectivity test completed."
+      async: 60
+      poll: 5
+
+    - name: Test Prometheus connectivity via bridge network
+      shell: |
+        echo "Waiting 30 seconds for Central Prometheus to be ready..."
+        sleep 30
+        
+        echo "Testing Central Prometheus connectivity via bridge network..."
+        
+        # Test direct access to Prometheus from cluster-2 container
+        echo "Testing Prometheus API access from cluster-2..."
+        if docker exec cluster-2 curl -s --connect-timeout 10 "http://{{ cluster_ips['cluster-1'] }}:9090/api/v1/status/config" > /dev/null 2>&1; then
+          echo "✓ Prometheus API accessible from cluster-2 via bridge network"
+        else
+          echo "✗ Prometheus API not accessible from cluster-2"
+        fi
+        
+        # Test local access within cluster-1
+        echo "Testing Prometheus API access within cluster-1..."
+        if docker exec cluster-1 curl -s --connect-timeout 10 "http://localhost:9090/api/v1/status/config" > /dev/null 2>&1; then
+          echo "✓ Prometheus API accessible within cluster-1"
+        else
+          echo "✗ Prometheus API not accessible within cluster-1"
+        fi
+        
+        echo "Bridge network Prometheus connectivity test completed."
+      async: 120
+      poll: 10
+
+    - name: Verify metrics collection (wait for initial data)
+      shell: |
+        echo "Waiting 30 seconds for initial metrics collection..."
+        sleep 30
+        
+        echo "Testing Central Prometheus connectivity..."
+        
+        # Check if jq is available, install if needed
+        if ! command -v jq &> /dev/null; then
+          echo "Installing jq for JSON parsing..."
+          apt-get update && apt-get install -y jq
+        fi
+      become: yes  # This needs root for package installation
+      async: 300
+      poll: 5
+
+    - name: Test Prometheus connectivity and collect basic metrics
+      shell: |
+        echo "=== Multi-Cluster Metrics Verification via Bridge Network ==="
+        
+        echo "1. Checking for cluster labels via bridge network:"
+        cluster_labels=$(docker exec cluster-1 curl -s "http://localhost:9090/api/v1/label/cluster_name/values" 2>/dev/null)
+        if echo "$cluster_labels" | jq -e '.data[]' > /dev/null 2>&1; then
+          echo "$cluster_labels" | jq -r '.data[]' 2>/dev/null
+        else
+          echo "No cluster_name labels found yet (this is normal for new deployments)"
+        fi
+        
+        echo "Basic connectivity test completed via bridge network."
+      async: 180
+      poll: 5
+
+    - name: Check metrics by cluster via bridge network
+      shell: |
+        echo "2. Checking metrics by cluster via bridge network:"
+        for cluster in cluster-1 cluster-2; do
+          echo "Metrics from $cluster:"
+          
+          # Check up metrics (with timeout)
+          up_response=$(docker exec cluster-1 timeout 10 curl -s -G "http://localhost:9090/api/v1/query" --data-urlencode "query=up{cluster_name=\"$cluster\"}" 2>/dev/null || echo '{"data":{"result":[]}}')
+          if echo "$up_response" | jq -e '.data.result' > /dev/null 2>&1; then
+            metric_count=$(echo "$up_response" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+          else
+            metric_count="0"
+          fi
+          echo "  - up metrics: $metric_count"
+          
+          # Check vLLM metrics (with timeout)
+          vllm_response=$(docker exec cluster-1 timeout 10 curl -s -G "http://localhost:9090/api/v1/query" --data-urlencode "query=vllm_request_total{cluster_name=\"$cluster\"}" 2>/dev/null || echo '{"data":{"result":[]}}')
+          if echo "$vllm_response" | jq -e '.data.result' > /dev/null 2>&1; then
+            vllm_count=$(echo "$vllm_response" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+          else
+            vllm_count="0"
+          fi
+          echo "  - vLLM metrics: $vllm_count"
+          
+          # Check DCGM metrics (with timeout)
+          dcgm_response=$(docker exec cluster-1 timeout 10 curl -s -G "http://localhost:9090/api/v1/query" --data-urlencode "query=DCGM_FI_DEV_GPU_UTIL{cluster_name=\"$cluster\"}" 2>/dev/null || echo '{"data":{"result":[]}}')
+          if echo "$dcgm_response" | jq -e '.data.result' > /dev/null 2>&1; then
+            dcgm_count=$(echo "$dcgm_response" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+          else
+            dcgm_count="0"
+          fi
+          echo "  - DCGM metrics: $dcgm_count"
+        done
+        
+        echo ""
+        echo "=== Setup Complete with Bridge Network! ==="
+        echo "Note: It may take a few minutes for all metrics to appear in Prometheus."
+        echo "If metrics are missing, check the OTEL collector logs:"
+        echo "  kubectl config use-context cluster-1"
+        echo "  kubectl logs -l app.kubernetes.io/name=otel-metrics-collector -n {{ otel_namespace }}"
+        echo "  kubectl config use-context cluster-2"
+        echo "  kubectl logs -l app.kubernetes.io/name=otel-metrics-collector -n {{ otel_namespace }}"
+        echo ""
+        echo "To access Prometheus UI:"
+        echo "  kubectl config use-context cluster-1"
+        echo "  kubectl port-forward -n {{ central_prometheus_namespace }} svc/central-prometheus 9090:9090"
+        echo "  Then open: http://localhost:9090"
+        echo ""
+        echo "Bridge Network Details:"
+        echo "  - cluster-1 IP: {{ cluster_ips['cluster-1'] }}"
+        echo "  - cluster-2 IP: {{ cluster_ips['cluster-2'] }}"
+        echo "  - Direct Prometheus access: http://{{ cluster_ips['cluster-1'] }}:9090"
+      async: 180
+      poll: 5 

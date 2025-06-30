@@ -5,7 +5,7 @@
   gather_facts: true
   vars:
     aws_region: us-east-2
-    instance_type:  g6.4xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
+    instance_type:  g6.12xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
     ami_id: ami-00f71ac70c2d6344d  # Ubuntu 22.04 with NVIDIA GPU driver
     key_pair: router-team-us-east2
     security_group_id: sg-0704e6bcaa5e655b1  # k8s security group
@@ -21,10 +21,18 @@
         state: present
       delegate_to: localhost
 
-    - name: Launch EC2 instance
+    - name: Check for existing instance before attempting launch
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          instance-state-name: [ "pending", "running", "stopping", "stopped" ]
+      register: existing_instance_info
+
+    - name: Attempt to launch EC2 instance, iterating through availability zones
       amazon.aws.ec2_instance:
         region: "{{ aws_region }}"
-        availability_zone: "{{ aws_region }}b"
+        availability_zone: "{{ item }}"
         name: "{{ instance_name }}"
         image_id: "{{ ami_id }}"
         instance_type: "{{ instance_type }}"
@@ -48,7 +56,31 @@
           AMI: "{{ ami_id }}"
           CreatedBy: ansible
           CreatedAt: "{{ ansible_date_time.iso8601 }}"
-      register: ec2_instance
+      register: ec2_instance_result
+      loop:
+        - "{{ aws_region }}a"
+        - "{{ aws_region }}b"
+        - "{{ aws_region }}c"
+      when: existing_instance_info.instances | length == 0
+      ignore_errors: true
+
+    - name: Gather info on the launched instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          instance-state-name: [ "pending", "running" ]
+      register: ec2_instance_info
+    
+    - name: Fail if no instance was launched
+      fail:
+        msg: "Failed to launch instance in any availability zone. Last error message: {{ (ec2_instance_result.results | selectattr('failed', 'defined') | list | last).msg | default('Could not determine error') }}"
+      when: ec2_instance_info.instances | length == 0
+
+    - name: Set instance facts for use in later tasks
+      set_fact:
+        ec2_instance:
+          instances: "{{ ec2_instance_info.instances }}"
 
     - name: Display instance information
       debug:

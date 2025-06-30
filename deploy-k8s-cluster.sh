@@ -29,19 +29,15 @@ deploy_cluster() {
 
     echo "Using inventory file: $INVENTORY_FILE"
 
-    echo "Configuring Kubernetes cluster..."
-    ansible-playbook -i "$INVENTORY_FILE" kubernetes-single-node.yaml
+    echo "Setting up multiple Minikube clusters..."
+    ansible-playbook -i "$INVENTORY_FILE" setup-minikube-clusters.yaml
 
-    echo "Deployment complete!"
+    echo "Setting up multi-cluster observability..."
+    ansible-playbook -i "$INVENTORY_FILE" multi-cluster-observability-setup.yaml
 
-    echo "Deploying LLM-D..."
-    ansible-playbook -i "$INVENTORY_FILE" llm-d-deploy.yaml
-
-    echo "Testing LLM-D..."
-    ansible-playbook -i "$INVENTORY_FILE" llm-d-test.yaml
-    
-    echo "Deploying OpenTelemetry Observability Stack..."
-    ansible-playbook -i "$INVENTORY_FILE" otel-observability-setup.yaml
+    echo "Multi-cluster setup complete!"
+    echo "You can now SSH into the instance and manage your clusters with 'minikube'."
+    echo "For example: 'minikube status -p cluster-1' or 'kubectl --context cluster-2 get pods'"
 
     echo ""
     echo "=== Instance Information ==="
@@ -66,6 +62,10 @@ deploy_cluster() {
         echo ""
         echo "SSH Access:"
         echo "$SSH_COMMAND"
+        echo ""
+        echo "Once logged in, you can manage your clusters with 'minikube' and 'kubectl'."
+        echo "Example: 'minikube status -p cluster-1'"
+        echo "Example: 'kubectl get nodes --context cluster-2'"
         echo ""
         echo "Full details saved to: $DETAILS_FILE"
     else

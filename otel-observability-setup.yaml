@@ -721,7 +721,9 @@
         
         echo ""
         echo "3. Sample metric with cluster filtering:"
-        curl -s "http://localhost:9091/api/v1/query?query=up{cluster=\"{{ cluster_name }}\"}" 2>/dev/null | jq -r '.data.result | length' 2>/dev/null || echo "0"
+        echo "Cluster: {{ cluster_name }}"
+        up_count=$(curl -s -G "http://localhost:9091/api/v1/query" --data-urlencode "query=up{cluster=\"{{ cluster_name }}\"}" 2>/dev/null | jq -r '.data.result | length' 2>/dev/null || echo "0")
+        echo "Up count: $up_count"
         
         echo ""
         echo "4. Checking for vLLM metrics:"
