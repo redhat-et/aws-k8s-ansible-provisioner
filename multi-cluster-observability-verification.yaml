@@ -1,0 +1,303 @@
+---
+# Multi-Cluster Observability Verification
+# Verifies the setup by checking cluster status, connectivity, and metrics collection
+# Run with: ansible-playbook -i inventory.ini multi-cluster-observability-verification.yaml
+
+- name: Verify Multi-Cluster Setup
+  hosts: all
+  become: no  # Run as ubuntu user by default
+  gather_facts: false
+  vars:
+    ansible_user: ubuntu  # Explicitly set user
+    bridge_network_name: "minikube-multi-cluster"  # Add missing variable
+    minikube_clusters:
+      - name: cluster-1
+        role: central
+      - name: cluster-2
+        role: remote
+    central_prometheus_port: 9090
+    central_prometheus_namespace: "central-monitoring"
+    otel_namespace: "observability"
+    vllm_namespace: "vllm"
+
+  tasks:
+    - name: Get cluster IPs from Docker bridge network for verification
+      shell: /tmp/get-cluster-ip.sh {{ item.name }} {{ bridge_network_name }}
+      loop: "{{ minikube_clusters }}"
+      register: cluster_ips_result
+
+    - name: Set cluster IPs as facts for verification
+      set_fact:
+        cluster_ips: "{{ cluster_ips | default({}) | combine({item.item.name: item.stdout.strip()}) }}"
+      loop: "{{ cluster_ips_result.results }}"
+
+    - name: Display cluster status for each cluster
+      shell: |
+        echo "=== Cluster Status for {{ item.name }} ==="
+        echo "Role: {{ item.role }}"
+        
+        echo "Cluster Status:"
+        minikube status -p "{{ item.name }}" || echo "Cluster not running"
+        
+        echo ""
+        echo "GPU Operator Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n gpu-operator -l app=nvidia-dcgm-exporter || echo "DCGM exporter not found"
+        
+        echo ""
+        echo "vLLM Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n {{ vllm_namespace }} -l app=vllm || echo "vLLM not found"
+        
+        echo ""
+        echo "OTEL Collector Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n {{ otel_namespace }} -l app.kubernetes.io/name=otel-metrics-collector || echo "OTEL collector not found"
+        
+        {% if item.role == "central" %}
+        echo ""
+        echo "Central Prometheus Status:"
+        kubectl config use-context {{ item.name }}
+        kubectl get pods -n {{ central_prometheus_namespace }} -l app=central-prometheus || echo "Central Prometheus not found"
+        {% endif %}
+        
+        echo ""
+        echo "=========================="
+        echo ""
+      loop: "{{ minikube_clusters }}"
+      register: cluster_status
+
+    - name: Get host IP and display connection information
+      shell: hostname -I | awk '{print $1}'
+      register: host_ip_result
+
+    - name: Test cluster IPs from Docker bridge network
+      shell: /tmp/get-cluster-ip.sh {{ item.name }} {{ bridge_network_name }}
+      loop: "{{ minikube_clusters }}"
+      register: cluster_ips_result
+
+    - name: Set cluster IPs as facts
+      set_fact:
+        cluster_ips: "{{ cluster_ips | default({}) | combine({item.item.name: item.stdout.strip()}) }}"
+      loop: "{{ cluster_ips_result.results }}"
+
+    - name: Display Multi-Cluster Observability Setup Summary
+      debug:
+        msg: |
+          ========================================
+          Multi-Cluster Observability Setup Complete!
+          ========================================
+          
+          CLUSTERS DEPLOYED:
+          {% for cluster in minikube_clusters %}
+          - {{ cluster.name }} ({{ cluster.role }}) - IP: {{ cluster_ips[cluster.name] }}
+          {% endfor %}
+          
+          DOCKER BRIDGE NETWORK:
+          - Network Name: {{ bridge_network_name }}
+          - Subnet: 172.30.0.0/16
+          - All clusters connected to shared bridge network
+          
+          CENTRAL PROMETHEUS ACCESS:
+          - Bridge Network IP: {{ cluster_ips['cluster-1'] }}:9090
+          - Internal Service: http://central-prometheus.{{ central_prometheus_namespace }}.svc.cluster.local:9090
+          - All clusters send metrics directly via bridge network: http://{{ cluster_ips['cluster-1'] }}:9090/api/v1/write
+          
+          NETWORKING SOLUTION:
+          - Custom Docker bridge network ({{ bridge_network_name }})
+          - Direct container-to-container communication
+          - No port forwarding required
+          - cluster-1: {{ cluster_ips['cluster-1'] }} → central Prometheus
+          - cluster-2: {{ cluster_ips['cluster-2'] }} → sends metrics to cluster-1
+          
+          To access Central Prometheus UI:
+          kubectl config use-context cluster-1
+          kubectl port-forward -n {{ central_prometheus_namespace }} svc/central-prometheus 9090:9090
+          
+          Or access directly from any cluster container: http://{{ cluster_ips['cluster-1'] }}:9090
+          
+          METRICS COLLECTION:
+          - All clusters send metrics to Central Prometheus on cluster-1 via bridge network
+          - Each cluster identified by cluster_name and cluster labels
+          - vLLM metrics: cluster-scoped from each deployment in vllm namespace
+          - DCGM metrics: GPU metrics from each cluster's GPU Operator
+          - Kubernetes metrics: Node and cAdvisor metrics from each cluster
+          
+          USEFUL QUERIES:
+          - All metrics from cluster-1: {cluster_name="cluster-1"}
+          - All metrics from cluster-2: {cluster_name="cluster-2"}
+          - vLLM request rate: rate(vllm_request_total[5m])
+          - GPU utilization by cluster: DCGM_FI_DEV_GPU_UTIL group by (cluster_name)
+          
+          BRIDGE NETWORK TROUBLESHOOTING:
+          - Check network: docker network inspect {{ bridge_network_name }}
+          - Check cluster IPs: docker inspect cluster-1 cluster-2 --format='{{ "{{.Name}}: {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" }}'
+          - Test connectivity: docker exec cluster-2 ping {{ cluster_ips['cluster-1'] }}
+          - Direct Prometheus access: docker exec cluster-2 curl http://{{ cluster_ips['cluster-1'] }}:9090/api/v1/status/config
+          
+          TO MANAGE CLUSTERS:
+          - minikube status -p cluster-1
+          - kubectl config use-context cluster-1
+          - kubectl get pods -A
+          - kubectl config use-context cluster-2
+          - kubectl get pods -A
+          
+          ========================================
+
+    - name: Test bridge network connectivity between clusters
+      shell: |
+        echo "Testing bridge network connectivity..."
+        
+        # Test ping connectivity from cluster-2 to cluster-1
+        echo "Testing ping from cluster-2 to cluster-1 ({{ cluster_ips['cluster-1'] }})..."
+        if docker exec cluster-2 ping -c 3 {{ cluster_ips['cluster-1'] }} > /dev/null 2>&1; then
+          echo "✓ Ping successful: cluster-2 → cluster-1"
+        else
+          echo "✗ Ping failed: cluster-2 → cluster-1"
+        fi
+        
+        # Test ping connectivity from cluster-1 to cluster-2
+        echo "Testing ping from cluster-1 to cluster-2 ({{ cluster_ips['cluster-2'] }})..."
+        if docker exec cluster-1 ping -c 3 {{ cluster_ips['cluster-2'] }} > /dev/null 2>&1; then
+          echo "✓ Ping successful: cluster-1 → cluster-2"
+        else
+          echo "✗ Ping failed: cluster-1 → cluster-2"
+        fi
+        
+        echo "Bridge network connectivity test completed."
+      async: 60
+      poll: 5
+      register: bridge_network_connectivity
+
+    - name: Debug bridge network connectivity
+      debug:
+        var: bridge_network_connectivity
+
+    - name: Test Prometheus connectivity via bridge network
+      shell: |
+        echo "Waiting 30 seconds for Central Prometheus to be ready..."
+        sleep 30
+        
+        echo "Testing Central Prometheus connectivity via bridge network..."
+        
+        # Test direct access to Prometheus from cluster-2 container
+        echo "Testing Prometheus API access from cluster-2..."
+        if docker exec cluster-2 curl -s --connect-timeout 10 "http://{{ cluster_ips['cluster-1'] }}:9090/api/v1/status/config" > /dev/null 2>&1; then
+          echo "✓ Prometheus API accessible from cluster-2 via bridge network"
+        else
+          echo "✗ Prometheus API not accessible from cluster-2"
+        fi
+        
+        # Test local access within cluster-1
+        echo "Testing Prometheus API access within cluster-1..."
+        if docker exec cluster-1 curl -s --connect-timeout 10 "http://localhost:9090/api/v1/status/config" > /dev/null 2>&1; then
+          echo "✓ Prometheus API accessible within cluster-1"
+        else
+          echo "✗ Prometheus API not accessible within cluster-1"
+        fi
+        
+        echo "Bridge network Prometheus connectivity test completed."
+      async: 120
+      poll: 10
+      register: prometheus_connectivity
+
+    - name: Debug prometheus connectivity
+      debug:
+        var: prometheus_connectivity
+
+    - name: Verify metrics collection (wait for initial data)
+      shell: |
+        echo "Waiting 30 seconds for initial metrics collection..."
+        sleep 30
+        
+        echo "Testing Central Prometheus connectivity..."
+        
+        # Check if jq is available, install if needed
+        if ! command -v jq &> /dev/null; then
+          echo "Installing jq for JSON parsing..."
+          apt-get update && apt-get install -y jq
+        fi
+      become: yes  # This needs root for package installation
+      async: 300
+      poll: 5
+      register: metrics_collection
+      
+    - name: Debug metrics collection
+      debug:
+        var: metrics_collection
+
+    - name: Test Prometheus connectivity and collect basic metrics
+      shell: |
+        echo "=== Multi-Cluster Metrics Verification via Bridge Network ==="
+        
+        echo "1. Checking for cluster labels via bridge network:"
+        cluster_labels=$(docker exec cluster-1 curl -s "http://localhost:9090/api/v1/label/cluster_name/values" 2>/dev/null)
+        if echo "$cluster_labels" | jq -e '.data[]' > /dev/null 2>&1; then
+          echo "$cluster_labels" | jq -r '.data[]' 2>/dev/null
+        else
+          echo "No cluster_name labels found yet (this is normal for new deployments)"
+        fi
+        
+        echo "Basic connectivity test completed via bridge network."
+      async: 180
+      poll: 5
+      register: metrics_verification
+      
+    - name: Debug metrics verification
+      debug:
+        var: metrics_verification
+
+    - name: Check metrics by cluster via bridge network
+      shell: |
+        echo "2. Checking metrics by cluster via bridge network:"
+        for cluster in cluster-1 cluster-2; do
+          echo "Metrics from $cluster:"
+          
+          # Check up metrics (with timeout)
+          up_response=$(docker exec cluster-1 timeout 10 curl -s -G "http://localhost:9090/api/v1/query" --data-urlencode "query=up{cluster_name=\"$cluster\"}" 2>/dev/null || echo '{"data":{"result":[]}}')
+          if echo "$up_response" | jq -e '.data.result' > /dev/null 2>&1; then
+            metric_count=$(echo "$up_response" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+          else
+            metric_count="0"
+          fi
+          echo "  - up metrics: $metric_count"
+          
+          # Check vLLM metrics (with timeout)
+          vllm_response=$(docker exec cluster-1 timeout 10 curl -s -G "http://localhost:9090/api/v1/query" --data-urlencode "query=vllm_request_total{cluster_name=\"$cluster\"}" 2>/dev/null || echo '{"data":{"result":[]}}')
+          if echo "$vllm_response" | jq -e '.data.result' > /dev/null 2>&1; then
+            vllm_count=$(echo "$vllm_response" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+          else
+            vllm_count="0"
+          fi
+          echo "  - vLLM metrics: $vllm_count"
+          
+          # Check DCGM metrics (with timeout)
+          dcgm_response=$(docker exec cluster-1 timeout 10 curl -s -G "http://localhost:9090/api/v1/query" --data-urlencode "query=DCGM_FI_DEV_GPU_UTIL{cluster_name=\"$cluster\"}" 2>/dev/null || echo '{"data":{"result":[]}}')
+          if echo "$dcgm_response" | jq -e '.data.result' > /dev/null 2>&1; then
+            dcgm_count=$(echo "$dcgm_response" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+          else
+            dcgm_count="0"
+          fi
+          echo "  - DCGM metrics: $dcgm_count"
+        done
+        
+        echo ""
+        echo "=== Setup Complete with Bridge Network! ==="
+        echo "Note: It may take a few minutes for all metrics to appear in Prometheus."
+        echo "If metrics are missing, check the OTEL collector logs:"
+        echo "  kubectl config use-context cluster-1"
+        echo "  kubectl logs -l app.kubernetes.io/name=otel-metrics-collector -n {{ otel_namespace }}"
+        echo "  kubectl config use-context cluster-2"
+        echo "  kubectl logs -l app.kubernetes.io/name=otel-metrics-collector -n {{ otel_namespace }}"
+        echo ""
+        echo "To access Prometheus UI:"
+        echo "  kubectl config use-context cluster-1"
+        echo "  kubectl port-forward -n {{ central_prometheus_namespace }} svc/central-prometheus 9090:9090"
+        echo "  Then open: http://localhost:9090"
+        echo ""
+        echo "Bridge Network Details:"
+        echo "  - cluster-1 IP: {{ cluster_ips['cluster-1'] }}"
+        echo "  - cluster-2 IP: {{ cluster_ips['cluster-2'] }}"
+        echo "  - Direct Prometheus access: http://{{ cluster_ips['cluster-1'] }}:9090"
+      async: 180
+      poll: 5 

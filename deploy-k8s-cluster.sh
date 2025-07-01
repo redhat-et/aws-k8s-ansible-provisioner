@@ -35,6 +35,9 @@ deploy_cluster() {
     echo "Setting up multi-cluster observability..."
     ansible-playbook -i "$INVENTORY_FILE" multi-cluster-observability-setup.yaml
 
+    echo "Verifying multi-cluster observability..."
+    ansible-playbook -i "$INVENTORY_FILE" multi-cluster-observability-verification.yaml
+
     echo "Multi-cluster setup complete!"
     echo "You can now SSH into the instance and manage your clusters with 'minikube'."
     echo "For example: 'minikube status -p cluster-1' or 'kubectl --context cluster-2 get pods'"
